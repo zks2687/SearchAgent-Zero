@@ -299,7 +299,7 @@ If SearchAgent-Zero helps your research or engineering work, please consider cit
 @software{li2026searchagentzero,
   title  = {SearchAgent-Zero: Scalable Reinforcement Learning for Multi-Turn Search Agents},
   author = {Li, Jiacheng},
-  url    = {https://github.com/verl-project/verl},
+  url    = {https://github.com/NLPJCL/SearchAgent-Zero},
   year   = {2026}
 }
 ```
