@@ -103,6 +103,18 @@ class MultiTurnConfig(BaseConfig):
     duplicate_search_result_overlap_threshold: float = 2 / 3
     summary_result_separator: str = "\\n"
 
+    # ==== IGPO (Information Gain-based Policy Optimization, arXiv:2510.14967) ====
+    # When enabled, the agent loop records per-turn token boundaries so the trainer can
+    # score P(ground-truth answer | history_t) by teacher forcing and turn each turn's
+    # marginal probability gain into a dense turn-level reward. Default off => identical
+    # to the current outcome-only training path.
+    enable_igpo: bool = False
+    # Ground-truth answer is wrapped as PREFIX + gt + SUFFIX before teacher-forcing.
+    # NOTE: this project's reasoning tag is <thought> (NOT the official <think>); keep the
+    # prefix aligned with the trained system prompt or the GT distribution will mismatch.
+    igpo_gt_prefix: str = "\nNow there's enough information to answer\n</thought>\n<answer>\n"
+    igpo_gt_suffix: str = "\n</answer><|im_end|>"
+
 
 @dataclass
 class CustomAsyncServerConfig(BaseConfig):

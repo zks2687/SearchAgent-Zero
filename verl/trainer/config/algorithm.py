@@ -668,6 +668,25 @@ class AlgoConfig(BaseConfig):
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
 
+    # ==== IGPO (Information Gain-based Policy Optimization, arXiv:2510.14967) ====
+    # Used by the `grpo_igpo` advantage estimator. info_gain_type selects how the marginal
+    # gain in P(GT|history_t) is turned into a per-turn reward:
+    #   "prob_diff":     r_t = exp(mean_logP_t) - exp(mean_logP_{t-1})   (default, official)
+    #   "log_prob_diff": r_t = mean_logP_t - mean_logP_{t-1}
+    # info_gain_norm_mode: "separate" normalizes info-gain and outcome rewards independently,
+    #   "joint" normalizes them together. igpo_gamma is the turn-level discount for
+    #   A_i = r_i + gamma * A_{i+1}. igpo_coef scales info-gain relative to the outcome reward.
+    # use_igpo_curriculum linearly anneals the info-gain / outcome weights across training.
+    info_gain_type: str = "prob_diff"
+    info_gain_norm_mode: str = "separate"
+    igpo_gamma: float = 1.0
+    igpo_coef: float = 1.0
+    use_igpo_curriculum: bool = False
+    igpo_ig_init: float = 1.0
+    igpo_ig_final: float = 0.2
+    igpo_f1_init: float = 1.0
+    igpo_f1_final: float = 1.0
+
 
 @dataclass
 class DiffusionAlgoConfig(BaseConfig):

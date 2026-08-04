@@ -210,6 +210,16 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+        # IGPO: pass the dense info-gain reward + turn-boundary mask prepared upstream
+        # (in the trainer fit loop). These are absent unless enable_igpo produced them.
+        if adv_estimator in ("grpo_igpo",):
+            if "index" not in adv_kwargs and "uid" in data.non_tensor_batch:
+                adv_kwargs["index"] = data.non_tensor_batch["uid"]
+            adv_kwargs["norm_adv_by_std_in_grpo"] = norm_adv_by_std_in_grpo
+            if "igpo_info_gain_reward" in data.batch.keys():
+                adv_kwargs["info_gain_reward"] = data.batch["igpo_info_gain_reward"]
+            if "igpo_turn_boundary_mask" in data.batch.keys():
+                adv_kwargs["turn_boundary_mask"] = data.batch["igpo_turn_boundary_mask"]
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -1197,6 +1207,151 @@ class RayPPOTrainer:
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
+    def _compute_igpo_info_gain(self, batch: DataProto) -> None:
+        """IGPO (arXiv:2510.14967): compute dense turn-level info-gain reward and write
+        `igpo_info_gain_reward` + `igpo_turn_boundary_mask` into `batch.batch`.
+
+        Pipeline (see verl/utils/igpo_gt_logprob.py for the pure, CPU-tested core):
+          1. Extract per-sample prompt/response token ids (unpadded), turn boundaries, and GT.
+          2. For each (sample, turn) build a teacher-forcing row [prompt+response[:e] + GT].
+          3. Score GT answer tokens' mean log-prob via actor.compute_log_prob (one batched fwd).
+          4. Turn per-turn mean log-probs into info-gain (prob_diff/log_prob_diff) and scatter
+             onto each turn's last token; also emit the turn-boundary mask.
+
+        Robust no-op: if IGPO metadata is missing, writes zeros (grpo_igpo then falls back to
+        plain GRPO inside the estimator).
+        """
+        from verl.utils.igpo_gt_logprob import IGPORewardBuilder
+
+        response_ids = batch.batch["responses"]           # (bsz, resp_len) left-padded? no: right side
+        prompt_ids = batch.batch["prompts"]               # (bsz, prompt_len)
+        attention_mask = batch.batch["attention_mask"]    # (bsz, prompt_len+resp_len)
+        bsz, resp_len = response_ids.shape
+        prompt_len = prompt_ids.shape[1]
+
+        ntb = batch.non_tensor_batch
+        turn_ends = ntb.get("igpo_turn_end_indices")
+        gts = ntb.get("igpo_ground_truth")
+        # Initialize outputs as zeros (safe default).
+        info_gain_reward = torch.zeros(bsz, resp_len, dtype=torch.float32)
+        turn_boundary_mask = torch.zeros(bsz, resp_len, dtype=torch.float32)
+        if turn_ends is None or gts is None:
+            batch.batch["igpo_info_gain_reward"] = info_gain_reward
+            batch.batch["igpo_turn_boundary_mask"] = turn_boundary_mask
+            return
+
+        # Unpad per-sample prompt/response token id lists using attention_mask.
+        prompt_mask = attention_mask[:, :prompt_len]
+        resp_mask = attention_mask[:, prompt_len:]
+        prompt_ids_per_sample, response_ids_per_sample, turn_ends_per_sample, gt_texts = [], [], [], []
+        for i in range(bsz):
+            p = prompt_ids[i][prompt_mask[i].bool()].tolist()
+            r = response_ids[i][resp_mask[i].bool()].tolist()
+            prompt_ids_per_sample.append(p)
+            response_ids_per_sample.append(r)
+            te = turn_ends[i]
+            turn_ends_per_sample.append(list(te) if te is not None else [])
+            g = gts[i]
+            gt_texts.append(g[0] if isinstance(g, (list, tuple, np.ndarray)) and len(g) else (g if isinstance(g, str) else ""))
+
+        builder = IGPORewardBuilder(
+            tokenizer=self.tokenizer,
+            info_gain_type=self.config.algorithm.get("info_gain_type", "prob_diff"),
+            gt_prefix=self.config.actor_rollout_ref.rollout.multi_turn.get(
+                "igpo_gt_prefix", "\nNow there's enough information to answer\n</thought>\n<answer>\n"
+            ),
+            gt_suffix=self.config.actor_rollout_ref.rollout.multi_turn.get("igpo_gt_suffix", "\n</answer><|im_end|>"),
+        )
+
+        def logprob_fn(rows):
+            """Teacher-forcing: mean log-prob of each row's GT answer tokens (GPU forward)."""
+            return self._igpo_score_rows(rows)
+
+        info_gain_reward, turn_boundary_mask = builder.build(
+            prompt_ids_per_sample=prompt_ids_per_sample,
+            response_ids_per_sample=response_ids_per_sample,
+            turn_end_indices_per_sample=turn_ends_per_sample,
+            gt_texts=gt_texts,
+            response_length=resp_len,
+            logprob_fn=logprob_fn,
+        )
+        batch.batch["igpo_info_gain_reward"] = info_gain_reward.to(response_ids.device)
+        batch.batch["igpo_turn_boundary_mask"] = turn_boundary_mask.to(response_ids.device)
+
+    def _igpo_score_rows(self, rows) -> list:
+        """Score GT answer tokens for a list of GTScoringRow via actor.compute_log_prob.
+
+        Each row is laid out in the standard verl "left-padded prompt + right-padded response"
+        format so `left_right_2_no_padding` + `compute_log_prob` score exactly the answer tokens:
+            prompt   = input_ids[:ans_start]          (history + GT prefix)  -> left padded
+            response = input_ids[ans_start:ans_end]   (the answer tokens)    -> right padded
+        compute_log_prob then returns log P(answer_i | history + prefix + answer[:i]); we mean
+        them per row.
+
+        NOTE (GPU path): this is the only IGPO piece that needs a GPU worker and cannot be
+        unit-tested on CPU. The pure reward math around it is covered by
+        verl/utils/igpo_gt_logprob.py.
+        """
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        n = len(rows)
+        prompt_parts = [r.input_ids[: r.ans_start] for r in rows]
+        resp_parts = [r.input_ids[r.ans_start : r.ans_end] for r in rows]
+        max_p = max(len(p) for p in prompt_parts)
+        max_r = max(len(x) for x in resp_parts)
+        seq_len = max_p + max_r
+
+        input_ids = torch.full((n, seq_len), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((n, seq_len), dtype=torch.long)
+        responses = torch.full((n, max_r), pad_id, dtype=torch.long)
+        response_mask = torch.zeros((n, max_r), dtype=torch.long)
+        for i, (p, rp) in enumerate(zip(prompt_parts, resp_parts)):
+            lp, lr = len(p), len(rp)
+            if lp > 0:
+                # prompt is LEFT-padded -> occupies [max_p-lp : max_p]
+                input_ids[i, max_p - lp : max_p] = torch.tensor(p, dtype=torch.long)
+                attention_mask[i, max_p - lp : max_p] = 1
+            # response is RIGHT-padded -> occupies [max_p : max_p+lr]
+            input_ids[i, max_p : max_p + lr] = torch.tensor(rp, dtype=torch.long)
+            attention_mask[i, max_p : max_p + lr] = 1
+            responses[i, :lr] = torch.tensor(rp, dtype=torch.long)
+            response_mask[i, :lr] = 1
+        # position ids: cumulative over valid tokens (left-padding aware)
+        position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+
+        td = DataProto.from_dict(
+            tensors={
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                # no_padding_2_padding needs "prompts" only for its .shape[1] (prompt segment
+                # length) to split attention_mask into prompt/response spans; content is unused.
+                # Our prompt span is input_ids[:, :max_p].
+                "prompts": input_ids[:, :max_p].clone(),
+                "responses": responses,
+                "response_mask": response_mask,
+            }
+        )
+        # The number of GT-scoring rows (= sum of valid turns across samples) is arbitrary and
+        # usually NOT divisible by the actor dp_size, which would fail the dispatch chunk assert
+        # (chunk_tensordict: "length divisible by chunks"). Pad to a dp_size multiple, then drop
+        # the duplicated tail rows after scoring.
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        td, pad_size = pad_dataproto_to_divisor(td, dp_size)
+        batch_td = td.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        # prepare_model_inputs reads micro_batch["temperature"] with no default; the normal
+        # log-prob path supplies it via batch.meta_info. Use temperature=1.0 so we score the
+        # true (unscaled) GT log-prob for the info-gain belief measurement, independent of the
+        # rollout sampling temperature.
+        tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False, temperature=1.0)
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        log_probs = tu.get(output, "log_probs")
+        log_probs = no_padding_2_padding(log_probs, batch_td)  # (n + pad_size, max_r)
+        lp = log_probs.float().cpu()[:n]  # drop padded rows -> (n, max_r)
+        denom = response_mask.sum(dim=-1).clamp(min=1)
+        mean_lp = (lp * response_mask).sum(dim=-1) / denom
+        return mean_lp.tolist()
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1489,6 +1644,13 @@ class RayPPOTrainer:
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        # IGPO: compute dense turn-level info-gain reward (teacher-forcing GT
+                        # log-prob) and stash it + the turn-boundary mask into the batch so the
+                        # grpo_igpo advantage estimator can consume them. No-op unless enabled.
+                        if self.config.algorithm.get("adv_estimator", "") == "grpo_igpo":
+                            with marked_timer("igpo_info_gain", timing_raw, color="magenta"):
+                                self._compute_igpo_info_gain(batch)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})

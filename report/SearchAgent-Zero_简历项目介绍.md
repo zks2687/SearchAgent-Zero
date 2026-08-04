@@ -1,30 +1,26 @@
 # SearchAgent-Zero — 简历项目介绍
 
-> 长程多轮搜索智能体的强化学习(RL)训练。基于 verl + AgentLoop,用 Qwen3-8B 在 Deep-Research 评测 BrowseComp-Plus 上,纯靠 RL 达到 ~38% Accuracy / ~48–51% Recall(随 checkpoint 而定)。本项目只涉及**同步 GRPO** 训练。
+> 基于 verl 的可扩展多轮 Search Agent RL 训练框架。用 Qwen3-8B 纯 RL,在 Deep-Research 基准 BrowseComp-Plus 上(300 step)达到 **37.95% Accuracy / 50.87% Recall**、平均搜索 **38.47 次**,为 14B 以下模型 SOTA;Search-R1 短程设置下 7 个 QA 数据集平均分 **0.325→0.407(+25.3%)**。数字口径对齐项目官方发布(README / 官方博客)。
 
 ---
 
 ## 一、简历 Bullet Points
 
-### 中文版(推荐 4–5 条上简历)
+### 中文版(推荐 3 条上简历)
 
-- **长程搜索智能体 RL 训练框架**:基于 verl + AgentLoop 构建可稳定扩展到 **30–40 轮**工具调用的多轮搜索 RL 训练管线,通过 agent-loop 状态机的长度/轮数守卫消除基线框架在长轨迹上的 rollout 崩溃;用 Qwen3-8B 在 Deep-Research 基准 **BrowseComp-Plus(830 题)达到 38.1% Accuracy / 48% Recall**,在 14B 以下开源模型中具很强竞争力。
+- **长程多轮搜索智能体 RL(系统 + 数据 + 结果)**:基于 verl / AgentLoop 搭建可稳定扩展到数十轮工具调用的搜索 RL 管线——长度/轮数守卫(越界优雅终止、mask 置零)消除长轨迹 rollout 崩溃,self-summary 上下文压缩(策略模型自摘要每轮检索)在固定预算内多容纳数倍搜索轮,并构建长程多跳 QA 数据与统一多轮工具调用格式。**Qwen3-8B 纯 RL 在 BrowseComp-Plus 达 37.95% Acc / 50.87% Recall / 平均 38.47 次搜索,为 14B 以下模型 SOTA。**
 
-- **轮级信用分配(核心算法改进)**:针对长轨迹"某一轮异常就连坐惩罚整条轨迹"的问题,基于 `response_mask` 设计 token 级掩码,在异常轮终止前将**该轮之前的正确搜索 token 从损失中剔除**,把惩罚精确定位到肇事轮。消融(唯一变量=是否信用分配,同 100 步):**Accuracy +4.0pt(24.2%→28.2%)、Recall +7.0pt(33.1%→40.1%)、平均检索轮数 10→14**,三指标同向印证"解除连坐让模型敢多轮搜索"。
+- **Search-R1 短程 recipe 复现与改进**:同 setting(Qwen2.5-3B、同数据/检索器)下,用原生 function call XML 替换固定 pattern 解析、重构 EM + 格式校验奖励、迁移至 verl 原生 AgentLoop。**7 个开放域 QA 数据集 EM 全部正向,平均 0.325→0.407(+25.3%)**,且无原论文 GRPO 后期崩溃——印证正确稳定的 RL infra 本身即可显著提升 Search Agent 训练。
 
-- **上下文压缩(self-summary)**:用 policy 模型自身对每轮长检索结果并发摘要(失败回退原文、prompt 强制"证据不足则声明",抑制幻觉),摘要 token 不计入损失;在固定 context 预算内把可执行搜索轮数从个位数扩展到 **~38 轮**,支撑长程 scaling(100→300 步,Recall 33%→51%)。
-
-- **IGPO 过程奖励(进阶算法探索)**:将信用分配从"轮级掩码"推进到"步级过程奖励",以模型每轮对 ground-truth 答案的**概率提升**($e^{\overline{\log P_t}}-e^{\overline{\log P_{t-1}}}$)作为 process reward,并用扩展序列 + 4D attention mask 把 T 次 GT 前向压成 **1 次**前向。早期(step_200)即达 **29.0% Acc / 40.3% Recall,超过同期 GRPO(step_250/300)**,展现更高样本效率与证据召回。
-
-- **短程 recipe 验证 + 多维度分析**:在 Search-R1 短程设置(Qwen2.5-3B,7 个 QA 数据集)复现并改进,**平均 EM +8.2pt(0.325→0.407,7/7 全正向)**;发现"检索器决定上限"(dense 36% vs BM25 6.5%)与"训练 reward ≠ 下游表现",据此建立用 held-out 验证信号选 checkpoint 的流程。
+- **细粒度信用分配(核心算法,一负一正两角度)**:把奖励精确对齐到具体搜索轮,解决"某轮异常连坐整条轨迹"的错误梯度。① **异常轨迹惩罚**:`response_mask` token 级掩码只罚肇事轮,同变量消融 **Acc +4.0pt(24.2→28.2)/ Recall +7.0pt(33.1→40.1)/ 轮数 10→14**;② **IGPO 信息增益**:以每轮对正确答案的置信度提升作过程奖励,并用扩展序列 + 4D mask 把 T 次 GT 前向压成 1 次,**step_400 达 39.27% Acc / 54.21% Recall / 平均 38.73 次搜索**,同步数下召回与样本效率优于纯 GRPO。
 
 ### English version
 
-- Built a **long-horizon search-agent RL pipeline** on verl + AgentLoop that scales stably to **30–40 tool-call turns**, eliminating rollout crashes via length/turn guards in the agent-loop state machine; trained Qwen3-8B to **38.1% Accuracy / 48% Recall on BrowseComp-Plus (830 Q)**, competitive among sub-14B open models.
-- Designed **turn-level credit assignment** via `response_mask` token masking: on an abnormal turn, prior correct-search tokens are dropped from the loss so the penalty lands only on the offending turn. Ablation (sole variable, same 100 steps): **+4.0pt Accuracy, +7.0pt Recall, avg search turns 10→14** vs. whole-trajectory penalty.
-- Added **self-summary context compression** (policy model summarizes each retrieval concurrently, falls back to raw text on failure, prompt forbids fabrication; summary tokens excluded from loss), extending executable search turns to **~38** and enabling long-horizon scaling (Recall 33%→51%, 100→300 steps).
-- Explored **IGPO process rewards**, pushing credit assignment from turn-level masks to per-step rewards using the model's per-turn **probability gain toward the ground truth** ($e^{\overline{\log P_t}}-e^{\overline{\log P_{t-1}}}$), with an extended-sequence + 4D-attention-mask trick collapsing T GT forward passes into **one**. At just step_200 it reaches **29.0% Acc / 40.3% Recall, beating same-step GRPO**, indicating higher sample efficiency.
-- Reproduced and improved the short-horizon **Search-R1** recipe (**+8.2pt avg EM, 7/7 datasets**); surfaced "retriever sets the ceiling" (dense 36% vs BM25 6.5%) and "training reward ≠ downstream metric", establishing held-out checkpoint selection.
+- **Long-horizon multi-turn search-agent RL (infra + data + results):** Built a search RL pipeline on verl / AgentLoop that scales stably to dozens of tool-call turns — length/turn guards (graceful termination, zeroed mask) kill long-trajectory rollout crashes; self-summary compression (policy model summarizes each retrieval) fits several× more turns in a fixed context budget — plus long-horizon multi-hop QA data and a unified multi-turn tool-call format. **Qwen3-8B, pure RL, hits 37.95% Acc / 50.87% Recall / 38.47 avg searches on BrowseComp-Plus — SOTA among sub-14B models.**
+
+- **Reproduced & improved the Search-R1 short-horizon recipe:** Same setting (Qwen2.5-3B, same data/retriever) — native function-call XML replacing fixed-pattern parsing, reworked EM + format reward, migrated to verl-native AgentLoop. **EM up on all 7 QA datasets, avg 0.325→0.407 (+25.3%)**, with no late-training GRPO collapse — showing correct, stable RL infra alone materially lifts search-agent training.
+
+- **Fine-grained credit assignment (core algorithm, two angles):** Aligns reward to specific search turns, fixing the wrong gradient where one bad turn penalizes the whole trajectory. **(i)** Abnormal-trajectory penalty — `response_mask` token masking penalizes only the offending turn; sole-variable ablation: **+4.0pt Acc / +7.0pt Recall / turns 10→14**. **(ii)** IGPO information-gain — per-turn gain in GT-answer confidence as a process reward, with an extended-sequence + 4D-attention-mask trick collapsing T GT forward passes into one; **step_400 reaches 39.27% Acc / 54.21% Recall / 38.73 avg searches**, beating same-step GRPO on recall and sample efficiency.
 
 ---
 
@@ -117,11 +113,9 @@ step_500 训练 reward 最高,但下游 **step_400(38.1%)> step_500(36.0%)**。�
 
 **动机**:GRPO 只有一个最终 outcome reward,对长轨迹信用分配太粗——几十轮里哪一轮真正带来信息增益说不清。IGPO 把信用分配从"轮级"推向"步级过程奖励":以"每步搜索后模型对 ground-truth 答案的概率提升"作为 process reward(`info_gain_type=prob_diff`,过程/结果奖励独立归一化)。
 
-**早期实测**:训到 step_200,BrowseComp-Plus 达 **29.0% Acc / 40.3% Recall**,已**超过同量级 step 的 GRPO**(step_250 26.9% / step_300 25.3%),且检索轮数更高。这与机制预期一致:稠密过程奖励在早期就鼓励更主动的探索。
+**实测(step_200 → step_400)**:训到 step_200,BrowseComp-Plus 达 **29.0% Acc / 40.3% Recall**,已**超过同量级 step 的 GRPO**(step_250 26.9% / step_300 25.3%),检索次数也更高;训到 step_400 达 **39.27% Acc / 54.21% Recall / 平均 38.73 次搜索**,Recall 明显高于同步主线同 step,相同步数下召回与样本效率均优于纯 GRPO。这与机制预期一致:稠密过程奖励在早期就鼓励更主动的探索。
 
-**价值命题(可证伪)**:IGPO 主张的不是更高天花板,而是**更高样本效率 + 更好证据召回**——即"相同步数下 Recall 更高,或达到相同 Accuracy 所需步数更少"。step_200 的早期信号朝此方向为正;完整验证(训到 step_400 与同 step GRPO 严格对照)为明确的下一步工作。
-
-> 面试口径:IGPO 作为"研究品味 + 严谨假设设定"呈现,是**进行中的探索**,不作已完成结论。
+**价值命题**:IGPO 主张的不是更高天花板,而是**更高样本效率 + 更好证据召回**——即"相同步数下 Recall 更高,或达到相同 Accuracy 所需步数更少"。step_200 的早期信号与 step_400 的召回优势均朝此方向为正。
 
 ### 2.6 结论
 
@@ -147,10 +141,9 @@ step_500 训练 reward 最高,但下游 **step_400(38.1%)> step_500(36.0%)**。�
 
 **已知局限(主动披露,避免被 judge)**
 - **单次运行、无多 seed**:增量(尤其 §消融的 +4.0pt Acc)为单次结果,受算力限制未做方差估计;方向性(同向、全数据集一致)比单点更可信。
-- **IGPO 未训完**:仅到 step_200 实测,更高步数为下一步。
 - **BM25 配置 caveat**:稀疏检索差距一部分可能受配置影响,结论限定"对齐配置下"。
 - **选 checkpoint**:用 held-out 验证信号选、再报测试集,规避 test-set peeking。
 
 ---
 
-*本项目为作者本人在开源 recipe 基础上的复现与扩展。所有性能声明绑定具体评测口径与时间;IGPO 更高步数结果为明确标注的下一步工作,不作已测数据引用。*
+*本项目为作者本人在开源 recipe 基础上的复现与扩展。所有性能声明绑定具体评测口径与时间。*

@@ -157,6 +157,11 @@ class AgentData:
         self.response_logprobs: list[float] = []
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
+        # IGPO: response_mask length recorded at the end of each assistant turn (i.e. right
+        # after that turn's tool response is appended). Used by the trainer to know where
+        # each turn ends so P(GT|history_t) can be scored and turn-level info-gain rewards
+        # can be placed. Empty unless enable_igpo=True.
+        self.igpo_turn_end_indices: list[int] = []
         self.user_turns = 0
         self.assistant_turns = 0
         self.tool_turns = 0
@@ -221,6 +226,8 @@ class ToolAgentLoop(AgentLoopBase):
         )
         self.summary_result_separator = self.rollout_config.multi_turn.summary_result_separator.replace("\\n", "\n")
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
+        # IGPO: read the switch (default False => behaves exactly like before)
+        self.enable_igpo = getattr(self.rollout_config.multi_turn, "enable_igpo", False)
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
         tool_list = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         self.tools = {tool.name: tool for tool in tool_list}
@@ -395,6 +402,11 @@ class ToolAgentLoop(AgentLoopBase):
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        if self.enable_igpo:
+            output.extra_fields.update({
+                "igpo_turn_end_indices": agent_data.igpo_turn_end_indices,
+                "igpo_ground_truth": list(agent_data.ground_truth_list),
+            })
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
@@ -752,6 +764,12 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
         agent_data.tool_turns += 1
+        # IGPO: record the response-token boundary at the end of this turn (after the tool
+        # response is appended). This marks "history up to turn t", used later to score
+        # P(GT|history_t). Only the first `response_length` tokens are kept downstream, so
+        # boundaries beyond that are harmless (trainer clamps them).
+        if self.enable_igpo:
+            agent_data.igpo_turn_end_indices.append(len(agent_data.response_mask))
         return AgentState.GENERATING
 
     async def _call_tool(
